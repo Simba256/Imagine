@@ -1,9 +1,6 @@
-uuid
-socket
-pickle
-numpy
-time
-threading
-subprocess
-json
-queue
+numpy==1.23.5  # For matrix computations and validation
+socket==1.1.0  # For networking (standard Python library, but ensure compatibility)
+pickle-mixin==1.0.2  # To handle serialized data transfers
+threading==1.0.0  # For threading (part of Python, added for clarity)
+jsonschema==4.19.0  # Optional: For JSON validation (if using JSON for points persistence)
+uuid==1.30  # For generating unique worker IDs
