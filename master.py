@@ -3,6 +3,7 @@ import pickle
 import threading
 import queue
 import numpy as np
+import os
 from singleSystem import split_matrices, aggregate_results
 from helper import send_data_in_chunks, receive_data_in_chunks
 from check import check, check_result
@@ -80,8 +81,9 @@ def worker_handler(conn, addr, task_queue, results, lock):
 # Fix the distribute_task function to manage multiple worker connections
 
 def distribute_task():
-    port = 65432
-    master_ip = get_local_ip()
+    port = int(os.environ.get("PORT", 65432))  # Default to 65432 for local testing
+    master_ip = "0.0.0.0"  # Bind to all available interfaces for public access
+
     print(f"Master node is running on IP: {master_ip}, Port: {port}")
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
