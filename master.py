@@ -1,154 +1,220 @@
+# master.py
 import socket
 import pickle
 import threading
 import queue
 import numpy as np
-import os
+import logging
+import requests  # For HTTP communication
 from singleSystem import split_matrices, aggregate_results
 from helper import send_data_in_chunks, receive_data_in_chunks
-from check import check, check_result
-from user_points import load_user_points, save_user_points
+from check import check
+from itertools import product  # For generating task combinations
 
+# Configure Logging
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s [%(levelname)s] %(threadName)s: %(message)s',
+    handlers=[
+        logging.FileHandler("master.log"),
+        logging.StreamHandler()
+    ]
+)
 
+# Master Node Configuration
+MASTER_IP = "0.0.0.0"  # Bind to all interfaces
+MASTER_PORT = 65432
+DATA_SERVER_IP = "192.168.1.4"  # Data Server IP
+DATA_SERVER_PORT = 5001
+DATA_SERVER_URL = f"http://{DATA_SERVER_IP}:{DATA_SERVER_PORT}"
 
+matrix_size = 4000  # Size of the matrices (400x400)
+block_size = 4     # Size of each block (4x4)
 
-
-
-
-
-
-
-
-matrix_size = 40
-block_size = 4
-global num_workers
-num_workers = 0
+# Retry Configuration
+MAX_RETRIES = 3  # Maximum number of retries per task
 
 def get_local_ip():
+    """
+    Retrieves the local IP address of the master node.
+    """
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            # Doesn't need to be reachable
             s.connect(("8.8.8.8", 80))
             return s.getsockname()[0]
     except Exception:
         return "127.0.0.1"
 
-# Inside master.py
-user_points = {}  # To track points for each worker ID
+# Global Task Queue
+task_queue = queue.Queue()
 
-def worker_handler(conn, addr, task_queue, results, lock):
-    worker_ip = addr[0]
-    worker_port = addr[1]
-    print(f"Worker connected from {worker_ip}:{worker_port}")
+# Assigned Tasks Tracking
+assigned_tasks = {}
+task_lock = threading.Lock()
+
+def worker_handler(conn, addr):
+    """
+    Handles communication with a connected worker.
+    """
+    worker_ip, worker_port = addr
+    thread_name = threading.current_thread().name
+    logging.info(f"Worker connected from {worker_ip}:{worker_port}")
 
     try:
         with conn:
+            # Receive username upon connection
+            try:
+                data = receive_data_in_chunks(conn)
+                if not data or len(data) != 1:
+                    raise ValueError("Expected username upon connection.")
+                username = data[0]
+                logging.info(f"Worker for user '{username}' connected from {worker_ip}:{worker_port}")
+            except Exception as e:
+                logging.error(f"Failed to receive username from {worker_ip}:{worker_port}: {e}")
+                return
+
+            # Validate user via Data Server
+            try:
+                response = requests.get(f"{DATA_SERVER_URL}/get_points", params={'username': username}, timeout=5)
+                logging.debug(f"Data Server response for '/get_points': Status {response.status_code}, Body {response.text}")
+                if response.status_code != 200:
+                    raise ValueError(f"User '{username}' not recognized.")
+                points = response.json().get('points', 0)
+                logging.info(f"User '{username}' is valid with {points} points.")
+            except Exception as e:
+                logging.error(f"Validation failed for user '{username}': {e}")
+                send_data_in_chunks(conn, None)  # Send termination signal
+                return
+
             while True:
-                task = task_queue.get() if not task_queue.empty() else None
-                if task is None:
-                    send_data_in_chunks(conn, None)  # Send termination signal
-                    print(f"No more tasks. Terminating worker {worker_ip}:{worker_port}.")
-                    break
-
-                send_data_in_chunks(conn, task)
-                print(f"Task sent to worker {worker_ip}:{worker_port}")
-
-                # Receive result from worker
                 try:
-                    worker_id, result = receive_data_in_chunks(conn)
+                    # Fetch a task from the global queue
+                    task = task_queue.get_nowait()
+                    a_block, b_block, retry_count = task
+                    logging.debug(f"Assigning task to user '{username}': Retry Count: {retry_count}")
+
+                    # Record the assignment
+                    with task_lock:
+                        assigned_tasks[thread_name] = task
+
+                    # Send task to worker
+                    send_data_in_chunks(conn, (a_block, b_block))
+                    logging.debug(f"Sent task to worker '{username}': {task}")
+
+                    # Receive result from worker
+                    data = receive_data_in_chunks(conn)
+                    if not data or len(data) != 2:
+                        raise ValueError("Expected tuple of (username, result).")
+
+                    received_username, result = data
+                    if received_username != username:
+                        raise ValueError(f"Username mismatch: {received_username} != {username}")
+
+                    logging.debug(f"Received result from user '{username}': {result}")
+
+                    # Validate the result
+                    try:
+                        is_valid = check(np.array(a_block), np.array(b_block), np.array(result))
+                    except Exception as e:
+                        logging.error(f"Validation error for user '{username}': {e}")
+                        is_valid = 0
+
+                    if is_valid == 1:
+                        # Increment user's points via Data Server
+                        try:
+                            new_points = points + 1
+                            update_response = requests.post(f"{DATA_SERVER_URL}/update_points", json={
+                                'username': username,
+                                'points': new_points
+                            }, timeout=5)
+                            logging.debug(f"Data Server response for '/update_points': Status {update_response.status_code}, Body {update_response.text}")
+                            if update_response.status_code != 200:
+                                raise ValueError("Failed to update points.")
+                            points = new_points
+                            logging.info(f"Valid result from user '{username}'. Points updated to {points}.")
+                            # Send updated points to worker
+                            send_data_in_chunks(conn, points)
+                            logging.debug(f"Sent updated points ({points}) to user '{username}'.")
+                        except Exception as e:
+                            logging.error(f"Failed to update/send points for user '{username}': {e}")
+                            # Requeue the task for reassignment
+                            task_queue.put((a_block, b_block, retry_count))
+                            continue  # Proceed to the next iteration
+                    else:
+                        # Requeue the task due to invalid result
+                        if retry_count < MAX_RETRIES:
+                            new_retry_count = retry_count + 1
+                            task_queue.put((a_block, b_block, new_retry_count))
+                            logging.warning(f"Invalid result from user '{username}'. Task requeued with retry count {new_retry_count}.")
+                        else:
+                            logging.error(f"Task failed after {MAX_RETRIES} retries. Discarding task: {task}")
+                    
+                    # Remove the task from assigned_tasks
+                    with task_lock:
+                        del assigned_tasks[thread_name]
+
+                except queue.Empty:
+                    # No more tasks available
+                    send_data_in_chunks(conn, None)  # Send termination signal
+                    logging.info(f"No more tasks available. Terminating worker '{username}'.")
+                    break
                 except Exception as e:
-                    print(f"Failed to receive result from worker {worker_ip}:{worker_port}: {e}")
-                    task_queue.put(task)  # Requeue task
+                    logging.error(f"Error during task assignment or result processing for user '{username}': {e}")
+                    # If a task was assigned but not processed, requeue it
+                    with task_lock:
+                        if thread_name in assigned_tasks:
+                            task = assigned_tasks[thread_name]
+                            task_queue.put(task)
+                            del assigned_tasks[thread_name]
                     break
 
-                if worker_id not in user_points:
-                    user_points[worker_id] = 0  # Initialize points for new worker
-
-                if check(np.array(task[0]), np.array(task[1]), np.array(result),
-                         block_size, block_size, block_size, matrix_size, matrix_size, block_size) == 1:
-                    with lock:
-                        results.append(result)
-                        user_points[worker_id] += 1
-                    print(f"Result accepted from Worker {worker_id}. Points: {user_points[worker_id]}")
-                else:
-                    task_queue.put(task)  # Requeue task
-                    print(f"Incorrect result from Worker {worker_id}. Task requeued.")
     except Exception as e:
-        print(f"Error with worker {worker_ip}:{worker_port}: {e}")
-    finally:
-        print(f"Worker handler for {worker_ip}:{worker_port} exiting.")
+        logging.error(f"Error handling worker {thread_name}: {e}")
 
+def distribute_tasks():
+    """
+    Initializes the master node, sets up the server to accept worker connections,
+    and manages task distribution.
+    """
+    master_ip = MASTER_IP
+    master_port = MASTER_PORT
 
-# Fix the distribute_task function to manage multiple worker connections
+    logging.info(f"Master node is running on IP: {get_local_ip()}, Port: {master_port}")
 
-def distribute_task():
-    port = int(os.environ.get("PORT", 65432))  # Default to 65432 for local testing
-    master_ip = "0.0.0.0"  # Bind to all available interfaces for public access
+    # Generate matrices and split into blocks once
+    matrix_a = np.random.randint(0, 10, size=(matrix_size, matrix_size))
+    matrix_b = np.random.randint(0, 10, size=(matrix_size, matrix_size))
+    try:
+        a_blocks, b_blocks = split_matrices(matrix_a, matrix_b, block_size)
+        logging.info(f"Split matrices into {len(a_blocks)} row blocks and {len(b_blocks)} column blocks.")
+    except Exception as e:
+        logging.error(f"Error splitting matrices: {e}")
+        return
 
-    print(f"Master node is running on IP: {master_ip}, Port: {port}")
+    # Enqueue n^2 tasks
+    total_tasks = 0
+    for a_block, b_block in product(a_blocks, b_blocks):
+        task_queue.put((a_block, b_block, 0))  # Initial retry_count=0
+        total_tasks += 1
+    logging.info(f"Enqueued a total of {total_tasks} tasks into the global task queue.")
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind((master_ip, port))
+        s.bind((master_ip, master_port))
         s.listen()
-        print("Master node is waiting for workers to connect...")
+        logging.info("Master node is waiting for workers to connect...")
 
-        # Task setup
-        matrix_a = np.random.randint(0, 10, size=(matrix_size, matrix_size))
-        matrix_b = np.random.randint(0, 10, size=(matrix_size, matrix_size))
-        print("Matrix A:")
-        print(matrix_a)
-        print("Matrix B:")
-        print(matrix_b)
-
-        a_blocks, b_blocks = split_matrices(matrix_a, matrix_b, block_size)
-        task_queue = queue.Queue()
-        for task in zip(a_blocks, b_blocks):
-            task_queue.put(task)
-
-        results = []
-        lock = threading.Lock()
-        threads = []
-        global num_workers  # Ensure `num_workers` is global
-        num_workers = 0
-
-        try:
-            while not task_queue.empty():
-                s.settimeout(10.0)  # Timeout to accept new connections
-                try:
-                    conn, addr = s.accept()
-                    print(f"Worker connected from {addr}")
-                    worker_thread = threading.Thread(
-                        target=worker_handler, args=(conn, addr, task_queue, results, lock)
-                    )
-                    worker_thread.start()
-                    threads.append(worker_thread)
-                    with lock:
-                        num_workers += 1
-                        print(f"Thread started for worker {addr}, Total workers: {num_workers}")
-                except socket.timeout:
-                    # No new connections within timeout, continue to next iteration
-                    pass
-
-            # Ensure all threads complete
-            print("All tasks distributed. Waiting for worker threads to complete...")
-            for thread in threads:
-                thread.join()
-                print(f"Thread {thread.name} has completed.")
-        except Exception as e:
-            print(f"Error in master node: {e}")
-        finally:
-            # Aggregate results
-            if results:
-                final_result = aggregate_results(results, matrix_a.shape, matrix_b.shape, block_size)
-                print("Final aggregated matrix multiplication result:")
-                print(final_result)
-            else:
-                print("No results received from workers.")
+        while True:
+            try:
+                conn, addr = s.accept()
+                logging.info(f"Accepted connection from {addr}")
+                worker_thread = threading.Thread(
+                    target=worker_handler, args=(conn, addr),
+                    name=f"WorkerHandler-{addr}"
+                )
+                worker_thread.start()
+            except Exception as e:
+                logging.error(f"Error accepting connections: {e}")
 
 if __name__ == "__main__":
-    try:
-        user_points = load_user_points()
-        distribute_task()
-    finally:
-        save_user_points(user_points)
-        print("User points saved. Final points distribution:")
-        print(user_points)
+    distribute_tasks()

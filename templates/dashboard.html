@@ -1,0 +1,249 @@
+<!-- templates/dashboard.html -->
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <title>User Dashboard</title>
+    <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.0/css/bootstrap.min.css">
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            text-align: center;
+            margin-top: 50px;
+        }
+
+        .spinner {
+            border: 8px solid #f3f3f3;
+            border-top: 8px solid #f6851b;
+            border-radius: 50%;
+            width: 60px;
+            height: 60px;
+            animation: spin 1s linear infinite;
+            margin: 20px auto;
+            display: none;
+        }
+
+        @keyframes spin {
+            0% {
+                transform: rotate(0deg);
+            }
+
+            100% {
+                transform: rotate(360deg);
+            }
+        }
+    </style>
+    <!-- Include Web3.js via CDN -->
+    <script src="https://cdn.jsdelivr.net/gh/ethereum/web3.js@1.7.4/dist/web3.min.js"></script>
+    <script>
+        // Smart Contract Details
+        const contractAddress = '0xC0f455Bb75eAE39D4508Cf1DAfA106317bfC902D';
+
+        // Initialize Web3
+        let web3;
+        let contract;
+        let userAccount;
+
+        window.addEventListener('load', async () => {
+            if (window.ethereum) {
+                web3 = new Web3(window.ethereum);
+                try {
+                    // Request account access if needed
+                    await window.ethereum.request({ method: 'eth_requestAccounts' });
+                    const accounts = await web3.eth.getAccounts();
+                    userAccount = accounts[0];
+
+                    const res = await fetch("{{ url_for('static', filename='contractABI.json')}}");
+                    const data = await res.json();
+
+                    // Initialize contract instance
+                    contract = new web3.eth.Contract(data.abi, contractAddress);
+                    // Enable Claim Airdrop button
+                    document.getElementById("claimAirdropButton").disabled = false;
+                } catch (error) {
+                    console.error("User denied account access or error occurred:", error);
+                }
+            } else {
+                alert('Please install MetaMask to use this feature.');
+            }
+        });
+
+        async function claimAirdrop() {
+            const spinner = document.getElementById("claimSpinner");
+            const claimButton = document.getElementById("claimAirdropButton");
+            spinner.style.display = "block";
+            claimButton.disabled = true;
+
+            try {
+                if (!contract) {
+                    throw new Error("Smart contract not initialized.");
+                }
+
+                // Hardcode airdropId as 0
+                const airdropId = 0;
+
+                // Send transaction to claimTokens
+                const tx = contract.methods.claimTokens(airdropId);
+                const gas = await tx.estimateGas({ from: userAccount });
+                const gasPrice = await web3.eth.getGasPrice();
+
+                const txData = {
+                    from: userAccount,
+                    to: contractAddress,
+                    data: tx.encodeABI(),
+                    gas,
+                    gasPrice
+                };
+
+                const receipt = await web3.eth.sendTransaction(txData);
+
+                console.log('Transaction receipt:', receipt);
+                alert('Airdrop claimed successfully!');
+
+                // Optionally, update points or UI here
+                // For example, reload the page to fetch updated points
+                window.location.reload();
+
+            } catch (error) {
+                console.error("Error claiming airdrop:", error);
+                alert('Failed to claim airdrop: ' + (error.message || error));
+            } finally {
+                spinner.style.display = "none";
+                claimButton.disabled = false;
+            }
+        }
+
+        async function connectWallet() {
+            const walletSpinner = document.getElementById("walletSpinner");
+            const connectWalletButton = document.getElementById("connectWalletButton");
+            walletSpinner.style.display = "block";
+            connectWalletButton.disabled = true;
+
+            if (typeof window.ethereum === 'undefined') {
+                alert('MetaMask is not installed. Please install it to use this feature.');
+                walletSpinner.style.display = "none";
+                connectWalletButton.disabled = false;
+                return;
+            }
+
+            try {
+                // Request account access
+                const accounts = await window.ethereum.request({ method: 'eth_requestAccounts' });
+                const walletAddress = accounts[0];
+                console.log('Connected wallet:', walletAddress);
+
+                // Send wallet address to the server
+                const response = await fetch("/connect_wallet", {
+                    method: "POST",
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ 'wallet_address': walletAddress })
+                });
+
+                const result = await response.json();
+                if (response.status === 200) {
+                    alert('Wallet connected successfully!');
+                    // Reload the page to show the wallet address
+                    window.location.reload();
+                } else {
+                    alert('Failed to connect wallet: ' + result.message);
+                }
+            } catch (error) {
+                console.error('Error connecting wallet:', error);
+                alert('Error connecting wallet.');
+            } finally {
+                walletSpinner.style.display = "none";
+                connectWalletButton.disabled = false;
+            }
+        }
+    </script>
+</head>
+
+<body>
+    <div class="container">
+        <h1>Welcome, {{ username }}!</h1>
+        <p>Your Points: <strong>{{ points }}</strong></p>
+
+        {% if not wallet_address %}
+        <button id="connectWalletButton" class="btn btn-primary" onclick="connectWallet()">Connect Wallet</button>
+        <div id="walletSpinner" class="spinner"></div>
+        {% else %}
+        <p>Wallet Address: <strong>{{ wallet_address }}</strong></p>
+        {% endif %}
+
+        {% if session.get('connected') %}
+        <!-- If the user is connected, show "Disconnect" -->
+        <form method="POST" action="/disconnect" style="display:inline;">
+            <button type="submit" class="btn btn-danger">Disconnect from Network</button>
+        </form>
+        {% else %}
+        <!-- If the user is NOT connected, show "Connect" -->
+        <form method="POST" action="/connect" style="display:inline;">
+            <button type="submit" class="btn btn-success">Connect to Network</button>
+        </form>
+        {% endif %}
+        <div id="spinner" class="spinner"></div>
+
+        <!-- Claim Airdrop Button -->
+        <div class="mt-4">
+            <button id="claimAirdropButton" class="btn btn-warning" onclick="claimAirdrop()" disabled>Claim
+                Airdrop</button>
+            <div id="claimSpinner" class="spinner"></div>
+        </div>
+
+        <br>
+        <a href="{{ url_for('logout') }}" class="btn btn-danger">Logout</a>
+        {% with messages = get_flashed_messages(with_categories=true) %}
+        {% if messages %}
+        {% for category, message in messages %}
+        <div class="alert alert-{{ category }} alert-dismissible fade show" role="alert" style="margin-top:20px;">
+            {{ message }}
+            <button type="button" class="close" data-dismiss="alert" aria-label="Close">
+                <span aria-hidden="true">&times;</span>
+            </button>
+        </div>
+        {% endfor %}
+        {% endif %}
+        {% endwith %}
+        <script>
+            function connectNetwork() {
+                // Show spinner
+                var spinner = document.getElementById('spinner');
+                spinner.style.display = 'block';
+
+                // Make the POST call to the '/connect' endpoint
+                fetch('/connect', {
+                    method: 'POST'
+                })
+                    .then(response => {
+                        // Hide spinner
+                        spinner.style.display = 'none';
+
+                        // Because your Flask route returns a redirect, 
+                        // you might need to handle that explicitly:
+                        if (response.redirected) {
+                            window.location.href = response.url;
+                        } else {
+                            // Or handle errors, etc.
+                            return response.text();
+                        }
+                    })
+                    .catch(error => {
+                        spinner.style.display = 'none';
+                        console.error('Error connecting to network:', error);
+                        alert('Failed to connect to network.');
+                    });
+            }
+        </script>
+
+    </div>
+
+    <!-- Bootstrap JS and dependencies -->
+    <script src="https://code.jquery.com/jquery-3.5.1.slim.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/popper.js@1.16.0/dist/umd/popper.min.js"></script>
+    <script src="https://stackpath.bootstrapcdn.com/bootstrap/4.5.0/js/bootstrap.min.js"></script>
+</body>
+
+</html>
