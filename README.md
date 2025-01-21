@@ -38,12 +38,12 @@ This project is a **blockchain-based** prototype that distributes matrix multipl
 │   └── contractABI.json       # ABI for the Solidity contract
 ├── templates/
 │   └── dashboard.html         # Basic frontend; references contractAddress
-├── airdrop_preparer.py        # Script to handle airdrop logic (token distribution)
+├── airdrop_preparer.py        # Script to handle airdrop logic (output is passed as parameters to smart contract on remix)
 ├── check.py                   # Utility checks or debugging
 ├── data_server.py             # Run this first; hosts data for the master/worker
 ├── helper.py                  # Helper functions for matrix ops, etc.
 ├── master.py                  # Main controller; breaks tasks into smaller jobs
-├── ml.py                      # ML or matrix multiplication logic (if separate from helper)
+├── ml.py                      # ML framework testing
 ├── singleSystem.py            # Possibly a test script for single-node systems
 ├── token.sol                  # Solidity smart contract for token creation & airdrop
 ├── user_points.json           # Local JSON for storing user (worker) points
